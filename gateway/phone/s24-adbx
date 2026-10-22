@@ -1,0 +1,37 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# s24-adbx - run adb against this phone's own adbd, for the s24 gateway.
+# Installed as $PREFIX/bin/s24-adbx. The gateway reaches it over SSH, so it works
+# on Wi-Fi, LTE or 5G as long as the phone is on the tailnet.
+#
+#   s24-adbx ensure          connect to the local adbd if needed
+#   s24-adbx shell B64       run a base64-encoded command as the adb shell user
+#   s24-adbx exec-out B64    same, with binary-safe output (screencap and the like)
+#   s24-adbx install APK     install or update an APK that is on the phone
+#
+# Commands arrive base64-encoded so they pass through SSH and two shells unquoted.
+# Exit 69 (with an "s24-adbx:" message) means adb itself is unavailable.
+set -u
+SERIAL=127.0.0.1:5555
+
+ensure() {
+	state=$(adb -s "$SERIAL" get-state 2>/dev/null)
+	if [ "$state" != device ]; then
+		adb connect "$SERIAL" >/dev/null 2>&1
+		state=$(adb -s "$SERIAL" get-state 2>&1)
+	fi
+	[ "$state" = device ] || { echo "s24-adbx: local adbd is not usable: ${state:-offline}" >&2; exit 69; }
+}
+
+case "${1:-}" in
+	ensure) ensure; echo device ;;
+	shell | exec-out)
+		[ $# -eq 2 ] || { echo "s24-adbx: usage: s24-adbx $1 B64" >&2; exit 64; }
+		ensure
+		cmd=$(printf %s "$2" | base64 -d) || { echo "s24-adbx: bad base64" >&2; exit 64; }
+		exec adb -s "$SERIAL" "$1" "$cmd" ;;
+	install)
+		[ $# -eq 2 ] || { echo "s24-adbx: usage: s24-adbx install APK" >&2; exit 64; }
+		ensure
+		exec adb -s "$SERIAL" install -r "$2" ;;
+	*) sed -n '6,9p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64 ;;
+esac
