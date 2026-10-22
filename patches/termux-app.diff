@@ -227,7 +227,7 @@ index cbd2992..564133e 100644
      <string name="action_style_terminal">Style</string>
      <string name="action_toggle_keep_screen_on">Keep screen on</string>
 diff --git a/termux-shared/src/main/java/com/termux/shared/termux/extrakeys/ExtraKeysView.java b/termux-shared/src/main/java/com/termux/shared/termux/extrakeys/ExtraKeysView.java
-index 4fbbf1e..92dd312 100644
+index 4fbbf1e..1084c4b 100644
 --- a/termux-shared/src/main/java/com/termux/shared/termux/extrakeys/ExtraKeysView.java
 +++ b/termux-shared/src/main/java/com/termux/shared/termux/extrakeys/ExtraKeysView.java
 @@ -7,6 +7,7 @@ import android.os.Handler;
@@ -238,34 +238,45 @@ index 4fbbf1e..92dd312 100644
  
  import java.util.ArrayList;
  import java.util.List;
-@@ -414,6 +415,10 @@ public final class ExtraKeysView extends GridLayout {
+@@ -30,6 +31,7 @@ import android.widget.PopupWindow;
+ 
+ import androidx.annotation.NonNull;
+ import androidx.annotation.Nullable;
++import androidx.core.widget.TextViewCompat;
+ 
+ import com.google.android.material.button.MaterialButton;
+ import com.termux.shared.R;
+@@ -413,6 +415,7 @@ public final class ExtraKeysView extends GridLayout {
+                 button.setTextColor(mButtonTextColor);
                  button.setAllCaps(mButtonTextAllCaps);
                  button.setPadding(0, 0, 0, 0);
++                setKeyTextAutoSize(button, buttonInfo);
  
-+                final boolean isLargeKey = isLargeKey(buttonInfo);
-+                if (isLargeKey)
-+                    button.setTextSize(TypedValue.COMPLEX_UNIT_PX, button.getTextSize() * LARGE_KEY_TEXT_SCALE);
-+
                  button.setOnClickListener(view -> {
                      performExtraKeyButtonHapticFeedback(view, buttonInfo, button);
-                     onAnyExtraKeyButtonClick(view, buttonInfo, button);
-@@ -477,7 +482,7 @@ public final class ExtraKeysView extends GridLayout {
+@@ -477,7 +480,7 @@ public final class ExtraKeysView extends GridLayout {
                      param.height = 0;
                  }
                  param.setMargins(0, 0, 0, 0);
 -                param.columnSpec = GridLayout.spec(col, GridLayout.FILL, 1.f);
-+                param.columnSpec = GridLayout.spec(col, GridLayout.FILL, isLargeKey ? LARGE_KEY_COLUMN_WEIGHT : 1.f);
++                param.columnSpec = GridLayout.spec(col, GridLayout.FILL, getKeyColumnWeight(buttonInfo));
                  param.rowSpec = GridLayout.spec(row, GridLayout.FILL, 1.f);
                  button.setLayoutParams(param);
  
-@@ -624,6 +629,19 @@ public final class ExtraKeysView extends GridLayout {
+@@ -624,6 +627,46 @@ public final class ExtraKeysView extends GridLayout {
  
  
  
-+    /** Text size multiplier for the {@link #isLargeKey(ExtraKeyButton)} keys. */
-+    public static final float LARGE_KEY_TEXT_SCALE = 1.8f;
-+    /** Column width weight for the {@link #isLargeKey(ExtraKeyButton)} keys; other keys use 1. */
++    /** Column width weight of the {@link #isLargeKey(ExtraKeyButton)} keys; symbol keys use 1. */
 +    public static final float LARGE_KEY_COLUMN_WEIGHT = 1.5f;
++    /** Column width weight of the {@link #isWordKey(ExtraKeyButton)} keys. */
++    public static final float WORD_KEY_COLUMN_WEIGHT = 1.35f;
++    /** Largest label sizes in sp. Labels shrink below these to fit their key on one line. */
++    public static final int LARGE_KEY_MAX_TEXT_SP = 34;
++    public static final int SYMBOL_KEY_MAX_TEXT_SP = 23;
++    public static final int WORD_KEY_MAX_TEXT_SP = 17;
++    /** Smallest label size in sp. */
++    public static final int KEY_MIN_TEXT_SP = 8;
 +
 +    /**
 +     * Check whether a {@link ExtraKeyButton} is the sessions drawer or keyboard toggle key, which
@@ -273,6 +284,27 @@ index 4fbbf1e..92dd312 100644
 +     */
 +    public boolean isLargeKey(ExtraKeyButton button) {
 +        return !button.isMacro() && ("DRAWER".equals(button.getKey()) || "KEYBOARD".equals(button.getKey()));
++    }
++
++    /** Check whether a {@link ExtraKeyButton} is labelled with a word (Esc, Ctrl, ...) rather than a symbol. */
++    public boolean isWordKey(ExtraKeyButton button) {
++        String display = button.getDisplay();
++        return display != null && display.codePointCount(0, display.length()) > 1;
++    }
++
++    /** Get the column width weight of a {@link ExtraKeyButton}. */
++    public float getKeyColumnWeight(ExtraKeyButton button) {
++        if (isLargeKey(button)) return LARGE_KEY_COLUMN_WEIGHT;
++        return isWordKey(button) ? WORD_KEY_COLUMN_WEIGHT : 1.f;
++    }
++
++    /** Draw a key's label as large as its key allows, on one line, up to a per-kind maximum. */
++    public void setKeyTextAutoSize(MaterialButton button, ExtraKeyButton buttonInfo) {
++        int maxSp = isLargeKey(buttonInfo) ? LARGE_KEY_MAX_TEXT_SP
++            : isWordKey(buttonInfo) ? WORD_KEY_MAX_TEXT_SP : SYMBOL_KEY_MAX_TEXT_SP;
++        button.setMaxLines(1);
++        TextViewCompat.setAutoSizeTextTypeUniformWithConfiguration(button,
++            KEY_MIN_TEXT_SP, maxSp, 1, TypedValue.COMPLEX_UNIT_SP);
 +    }
 +
      /** Check whether a {@link ExtraKeyButton} is a {@link SpecialButton}. */

@@ -23,7 +23,10 @@ export ORG_GRADLE_PROJECT_s24KeyAlias=s24
 export ORG_GRADLE_PROJECT_s24StorePassword=$S24_STORE_PASSWORD
 export ORG_GRADLE_PROJECT_s24KeyPassword=$S24_STORE_PASSWORD
 
+# Patch from clean upstream sources every time, so an edited patch script never
+# lands on top of its previous version. Local edits in the checkouts are discarded.
 for repo in termux-app termux-boot; do
+	git -C "$repo" checkout -q -- .
 	python3 patches/apply_signing.py "$repo/app/build.gradle"
 done
 (cd termux-app && python3 ../patches/apply_session_close.py)

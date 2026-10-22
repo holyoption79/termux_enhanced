@@ -4,7 +4,8 @@
 #   scripts/device-tc.sh
 # Before running: phone unlocked, Termux in front at a shell prompt in the
 # home directory, sessions drawer closed. Don't touch the phone while it runs.
-# Env: ADB (default adb), SSH_HOST (default s24).
+# Env: ADB (default adb), SSH_HOST (default s24), ANDROID_SERIAL when several
+# devices are attached.
 # Prints PASS/FAIL per check; the exit status is the number of failures.
 set -u
 
@@ -60,20 +61,20 @@ tap 'text="Ctrl"'; adb_sh input text a; sleep 0.3
 tap 'text="Alt"'; adb_sh input text x; sleep 0.3
 for k in Esc ↹ ← ↓ ↑ →; do swipe_up "text=\"$k\""; done
 adb_sh input keyevent 66; sleep 0.5
-swipe_up 'text="^C"'; sleep 1 # popup ^D: EOF on an empty line ends cat
+tap 'text="Ctrl"'; adb_sh input text d; sleep 1 # Ctrl+d: EOF on an empty line ends cat
 want='^[^I^[[D^[[B^[[A^[[C^A^[x~|^[[H^[[6~^[[5~^[[F$'
 got=$(phone 'cat ~/.device-tc-keys; rm -f ~/.device-tc-keys')
 [ "$got" = "$want" ] && r=ok || r=bad
 check "T1 keys and popups send the right bytes" $r "got '$got', want '$want'"
 [ -z "$(pids_of cat -A)" ] && r=ok || r=bad
-check "T1 ^D popup ends cat" $r
+check "T1 Ctrl+d ends cat" $r
 
-# T2: ^C interrupts the foreground job.
+# T2: Ctrl+c interrupts the foreground job.
 type_line 'sleep 4242'
 [ -n "$(pids_of sleep 4242)" ] || echo "  setup: sleep 4242 did not start" >&2
-tap 'text="^C"'; sleep 0.8
+tap 'text="Ctrl"'; adb_sh input text c; sleep 0.8
 [ -z "$(pids_of sleep 4242)" ] && r=ok || r=bad
-check "T2 ^C interrupts the foreground job" $r
+check "T2 Ctrl+c interrupts the foreground job" $r
 
 # T3: the keyboard key hides and shows the soft keyboard (the row moves, so re-read it).
 dump; tap 'text="⌨"'; sleep 0.8

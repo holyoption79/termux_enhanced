@@ -11,8 +11,10 @@ the GUI**, even when the soft keyboard is unresponsive.
 - **Close button per session** in the sessions drawer. Tapping ✕ asks for confirmation,
   then SIGKILLs the session's foreground process group and its shell, and removes the
   session from the list. This works when the session is stuck in a full-screen program.
-- **Larger ☰ (drawer) and ⌨ (keyboard toggle) extra keys.** These are the way out when
-  the keyboard is stuck, so they get 1.5× the column width and a 1.8× symbol.
+- **Extra keys drawn as large as their cells allow.** Every label is auto-sized to fill its
+  key on one line. ☰ (drawer) and ⌨ (keyboard toggle) are the way out when the keyboard is
+  stuck, so they get the widest columns and the largest symbols (up to 34 sp); word keys
+  (Esc, Ctrl, Alt) get wider columns (up to 17 sp); arrows and tab fill the rest (up to 23 sp).
 - **Own signing key**, shared with a rebuilt **Termux:Boot**, so the boot add-on can run
   scripts in Termux's user id and start sshd after a reboot.
 
@@ -20,15 +22,15 @@ the GUI**, even when the soft keyboard is unresponsive.
 
 | File | Installs to | Purpose |
 |---|---|---|
-| `termux.properties` | `~/.termux/` | One row of extra keys (`☰ ⌨ Esc ↹ Ctrl Alt ← ↓ ↑ → ^C`), dark drawer, bar cursor, small margins |
+| `termux.properties` | `~/.termux/` | One row of extra keys (`☰ ⌨ Esc ↹ Ctrl Alt ← ↓ ↑ →`), dark drawer, bar cursor, small margins |
 | `colors.properties` | `~/.termux/` | AMOLED black background with the Catppuccin Mocha palette |
 | `bashrc.snippet` | append to `~/.bashrc` | Start sshd when a shell opens and it is not running; `trap "exit 0" USR1` for `sk` |
 | `boot/10-sshd` | `~/.termux/boot/` | Termux:Boot: take a wakelock and start sshd at boot |
 | `bin/sk` | `$PREFIX/bin/` | Close sessions from the command line or a `dialog` menu |
 | `bin/s24-ai-run` | `$PREFIX/bin/` | Run `claude`, `codex` and `opencode` inside proot Debian (symlink each name to it) |
 
-Swipe up on an extra key for its popup: `Esc`→`~`, `↹`→`|`, arrows→`HOME`/`PGDN`/`PGUP`/`END`,
-`^C`→`^D`.
+Swipe up on an extra key for its popup: `Esc`→`~`, `↹`→`|`, arrows→`HOME`/`PGDN`/`PGUP`/`END`.
+`Ctrl` then `c` or `d` gives `^C` and `^D`.
 
 The font is [D2Coding](https://github.com/naver/d2codingfont) (SIL OFL). Hangul is exactly two
 cells wide, so mixed Korean text lines up in TUIs. It is not included here; install it with:
@@ -83,7 +85,7 @@ the update. `scripts/restore-phone.sh` restores a home backup into a fresh insta
 `scripts/device-tc.sh` drives the real UI over adb and checks the results over SSH. It covers:
 
 - every extra key and popup sends the right bytes (captured with `cat -A`);
-- `^C` interrupts a foreground job;
+- `Ctrl`+`c` interrupts a foreground job and `Ctrl`+`d` ends `cat`;
 - `⌨` hides and shows the soft keyboard;
 - the drawer's ✕ asks for confirmation, kills a stuck session's process and removes the session;
 - exactly one sshd is running and the pid file the `.bashrc` guard reads is live.
@@ -92,6 +94,5 @@ the update. `scripts/restore-phone.sh` restores a home backup into a fresh insta
 ADB=adb SSH_HOST=s24 scripts/device-tc.sh   # phone unlocked, Termux in front, drawer closed
 ```
 
-Last run on 2026-10-22, SM-S928N: 11/11 checks passed. The landscape layout and the absence of
-settings parse errors in logcat were checked by hand. Starting sshd at boot through Termux:Boot
-has not yet been tested with a reboot.
+Not covered: starting sshd at boot through Termux:Boot (needs a reboot), external keyboards and
+key repeat on long press.
