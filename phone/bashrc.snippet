@@ -1,0 +1,10 @@
+# >>> s24-sshd >>>
+# Keep the Termux SSH server up: start sshd and hold a wakelock whenever a shell opens and it is not running.
+if [ "$(uname -o 2>/dev/null)" = Android ] && ! kill -0 "$(cat "$PREFIX/var/run/sshd.pid" 2>/dev/null)" 2>/dev/null; then
+  sshd && termux-wake-lock
+fi
+# <<< s24-sshd <<<
+# >>> s24-session-close >>>
+# `sk` closes a session with SIGUSR1; exiting 0 lets Termux drop the session instead of leaving "[Process completed]".
+trap "exit 0" USR1
+# <<< s24-session-close <<<

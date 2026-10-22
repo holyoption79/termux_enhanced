@@ -147,3 +147,14 @@ vite.config.ts.timestamp-*
 
 # Turbo Repo
 .turbo
+
+# S24 Termux build: private signing key, upstream checkouts, build outputs, backups
+keystore/
+*.jks
+signing.env
+termux-app/
+termux-boot/
+out/
+*.apk
+backup/
+*.tgz

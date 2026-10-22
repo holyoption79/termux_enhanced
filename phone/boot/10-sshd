@@ -1,0 +1,4 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# Keep the SSH server up from boot: hold a wakelock, then start sshd.
+termux-wake-lock
+sshd

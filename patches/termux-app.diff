@@ -1,0 +1,280 @@
+diff --git a/app/build.gradle b/app/build.gradle
+index 33c88d1..574cfe7 100644
+--- a/app/build.gradle
++++ b/app/build.gradle
+@@ -79,10 +79,10 @@ android {
+ 
+     signingConfigs {
+         debug {
+-            storeFile file('testkey_untrusted.jks')
+-            keyAlias 'alias'
+-            storePassword 'xrj45yWGLbsO7W0v'
+-            keyPassword 'xrj45yWGLbsO7W0v'
++            storeFile file(project.findProperty('s24StoreFile') ?: 'testkey_untrusted.jks')
++            keyAlias project.findProperty('s24KeyAlias') ?: 'alias'
++            storePassword project.findProperty('s24StorePassword') ?: 'xrj45yWGLbsO7W0v'
++            keyPassword project.findProperty('s24KeyPassword') ?: 'xrj45yWGLbsO7W0v'
+         }
+     }
+ 
+diff --git a/app/src/main/java/com/termux/app/terminal/TermuxSessionsListViewController.java b/app/src/main/java/com/termux/app/terminal/TermuxSessionsListViewController.java
+index bf914b9..76b6d57 100644
+--- a/app/src/main/java/com/termux/app/terminal/TermuxSessionsListViewController.java
++++ b/app/src/main/java/com/termux/app/terminal/TermuxSessionsListViewController.java
+@@ -1,6 +1,7 @@
+ package com.termux.app.terminal;
+ 
+ import android.annotation.SuppressLint;
++import android.app.AlertDialog;
+ import android.graphics.Color;
+ import android.graphics.Paint;
+ import android.graphics.Typeface;
+@@ -50,8 +51,12 @@ public class TermuxSessionsListViewController extends ArrayAdapter<TermuxSession
+         }
+ 
+         TextView sessionTitleView = sessionRowView.findViewById(R.id.session_title);
++        TextView sessionCloseView = sessionRowView.findViewById(R.id.session_close);
+ 
+-        TerminalSession sessionAtRow = getItem(position).getTerminalSession();
++        TermuxSession termuxSessionAtRow = getItem(position);
++        sessionCloseView.setOnClickListener(v -> confirmCloseSession(termuxSessionAtRow));
++
++        TerminalSession sessionAtRow = termuxSessionAtRow.getTerminalSession();
+         if (sessionAtRow == null) {
+             sessionTitleView.setText("null session");
+             return sessionRowView;
+@@ -60,7 +65,7 @@ public class TermuxSessionsListViewController extends ArrayAdapter<TermuxSession
+         boolean shouldEnableDarkTheme = ThemeUtils.shouldEnableDarkTheme(mActivity, NightMode.getAppNightMode().getName());
+ 
+         if (shouldEnableDarkTheme) {
+-            sessionTitleView.setBackground(
++            sessionRowView.setBackground(
+                 ContextCompat.getDrawable(mActivity, R.drawable.session_background_black_selected)
+             );
+         }
+@@ -89,9 +94,27 @@ public class TermuxSessionsListViewController extends ArrayAdapter<TermuxSession
+         int defaultColor = shouldEnableDarkTheme ? Color.WHITE : Color.BLACK;
+         int color = sessionRunning || sessionAtRow.getExitStatus() == 0 ? defaultColor : Color.RED;
+         sessionTitleView.setTextColor(color);
++        sessionCloseView.setTextColor(defaultColor);
+         return sessionRowView;
+     }
+ 
++    /** Ask before closing, since closing kills whatever the session is running. */
++    private void confirmCloseSession(@NonNull TermuxSession termuxSession) {
++        final TerminalSession session = termuxSession.getTerminalSession();
++        if (session == null) return;
++        int number = getPosition(termuxSession) + 1;
++
++        new AlertDialog.Builder(mActivity)
++            .setTitle(mActivity.getString(R.string.title_close_session, number))
++            .setMessage(session.isRunning() ? R.string.msg_close_running_session : R.string.msg_close_finished_session)
++            .setPositiveButton(R.string.action_close_session, (dialog, id) -> {
++                dialog.dismiss();
++                mActivity.getTermuxTerminalSessionClient().closeSession(session);
++            })
++            .setNegativeButton(android.R.string.cancel, null)
++            .show();
++    }
++
+     @Override
+     public void onItemClick(AdapterView<?> parent, View view, int position, long id) {
+         TermuxSession clickedSession = getItem(position);
+diff --git a/app/src/main/java/com/termux/app/terminal/TermuxTerminalSessionActivityClient.java b/app/src/main/java/com/termux/app/terminal/TermuxTerminalSessionActivityClient.java
+index bd78914..68a4af2 100644
+--- a/app/src/main/java/com/termux/app/terminal/TermuxTerminalSessionActivityClient.java
++++ b/app/src/main/java/com/termux/app/terminal/TermuxTerminalSessionActivityClient.java
+@@ -10,6 +10,8 @@ import android.content.pm.PackageManager;
+ import android.graphics.Typeface;
+ import android.media.AudioAttributes;
+ import android.media.SoundPool;
++import android.system.Os;
++import android.system.OsConstants;
+ import android.text.TextUtils;
+ import android.widget.ListView;
+ 
+@@ -32,10 +34,14 @@ import com.termux.terminal.TerminalSession;
+ import com.termux.terminal.TerminalSessionClient;
+ import com.termux.terminal.TextStyle;
+ 
++import java.io.BufferedReader;
+ import java.io.File;
+ import java.io.FileInputStream;
++import java.io.FileReader;
+ import java.io.InputStream;
++import java.util.HashSet;
+ import java.util.Properties;
++import java.util.Set;
+ 
+ /** The {@link TerminalSessionClient} implementation that may require an {@link Activity} for its interface methods. */
+ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionClientBase {
+@@ -50,6 +56,9 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
+ 
+     private static final String LOG_TAG = "TermuxTerminalSessionActivityClient";
+ 
++    /** Sessions closed from the drawer; each is removed as soon as its shell exits. */
++    private final Set<TerminalSession> mSessionsPendingClose = new HashSet<>();
++
+     public TermuxTerminalSessionActivityClient(TermuxActivity activity) {
+         this.mActivity = activity;
+     }
+@@ -145,6 +154,12 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
+             return;
+         }
+ 
++        if (mSessionsPendingClose.remove(finishedSession)) {
++            if (service.getIndexOfSession(finishedSession) >= 0)
++                removeFinishedSession(finishedSession);
++            return;
++        }
++
+         int index = service.getIndexOfSession(finishedSession);
+ 
+         // For plugin commands that expect the result back, we should immediately close the session
+@@ -341,6 +356,37 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
+     }
+ 
+     @SuppressLint("InflateParams")
++    /**
++     * Close a session from the drawer even when it is stuck: SIGKILL its foreground
++     * process group and its shell, then drop it in {@link #onSessionFinished}.
++     */
++    public void closeSession(@NonNull TerminalSession session) {
++        if (!session.isRunning()) {
++            if (mActivity.getTermuxService() != null && mActivity.getTermuxService().getIndexOfSession(session) >= 0)
++                removeFinishedSession(session);
++            return;
++        }
++
++        mSessionsPendingClose.add(session);
++        killForegroundProcessGroup(session.getPid());
++        session.finishIfRunning();
++    }
++
++    /** SIGKILL the terminal's foreground job (tpgid, field 8 of /proc/PID/stat) if it is not the shell. */
++    private static void killForegroundProcessGroup(int shellPid) {
++        if (shellPid <= 0) return;
++        try (BufferedReader reader = new BufferedReader(new FileReader("/proc/" + shellPid + "/stat"))) {
++            String stat = reader.readLine();
++            String[] fields = stat.substring(stat.lastIndexOf(')') + 2).split(" ");
++            int foregroundGroup = Integer.parseInt(fields[5]);
++            if (foregroundGroup > 0 && foregroundGroup != shellPid)
++                Os.kill(-foregroundGroup, OsConstants.SIGKILL);
++        } catch (Exception e) {
++            // The shell's SIGKILL still hangs up the terminal, which ends most jobs.
++            Logger.logWarn(LOG_TAG, "Failed to kill foreground process group of pid " + shellPid + ": " + e.getMessage());
++        }
++    }
++
+     public void renameSession(final TerminalSession sessionToRename) {
+         if (sessionToRename == null) return;
+ 
+diff --git a/app/src/main/res/layout/item_terminal_sessions_list.xml b/app/src/main/res/layout/item_terminal_sessions_list.xml
+index 46cfecc..d76de6c 100644
+--- a/app/src/main/res/layout/item_terminal_sessions_list.xml
++++ b/app/src/main/res/layout/item_terminal_sessions_list.xml
+@@ -1,9 +1,31 @@
+-<com.google.android.material.textview.MaterialTextView xmlns:android="http://schemas.android.com/apk/res/android"
+-    android:id="@+id/session_title"
++<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    android:id="@+id/session_row"
+     android:layout_width="fill_parent"
+     android:layout_height="?android:attr/listPreferredItemHeight"
+     android:background="@drawable/session_background_selected"
+-    android:ellipsize="marquee"
+-    android:gravity="start|center_vertical"
+-    android:padding="6dip"
+-    android:textSize="14sp" />
++    android:orientation="horizontal">
++
++    <com.google.android.material.textview.MaterialTextView
++        android:id="@+id/session_title"
++        android:layout_width="0dp"
++        android:layout_height="match_parent"
++        android:layout_weight="1"
++        android:ellipsize="marquee"
++        android:gravity="start|center_vertical"
++        android:padding="6dip"
++        android:textSize="14sp" />
++
++    <!-- Not focusable, so tapping the rest of the row still selects the session. -->
++    <TextView
++        android:id="@+id/session_close"
++        android:layout_width="48dp"
++        android:layout_height="match_parent"
++        android:background="?android:attr/selectableItemBackgroundBorderless"
++        android:contentDescription="@string/action_close_session"
++        android:focusable="false"
++        android:focusableInTouchMode="false"
++        android:gravity="center"
++        android:text="\u2715"
++        android:textSize="20sp" />
++
++</LinearLayout>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index cbd2992..564133e 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -81,6 +81,10 @@
+ 
+     <string name="action_kill_process">Kill process (%d)</string>
+     <string name="title_confirm_kill_process">Really kill this session?</string>
++    <string name="action_close_session">Close</string>
++    <string name="title_close_session">Close session [%1$d]?</string>
++    <string name="msg_close_running_session">Its running programs are killed, even if the session is stuck.</string>
++    <string name="msg_close_finished_session">This session has already exited.</string>
+ 
+     <string name="action_style_terminal">Style</string>
+     <string name="action_toggle_keep_screen_on">Keep screen on</string>
+diff --git a/termux-shared/src/main/java/com/termux/shared/termux/extrakeys/ExtraKeysView.java b/termux-shared/src/main/java/com/termux/shared/termux/extrakeys/ExtraKeysView.java
+index 4fbbf1e..92dd312 100644
+--- a/termux-shared/src/main/java/com/termux/shared/termux/extrakeys/ExtraKeysView.java
++++ b/termux-shared/src/main/java/com/termux/shared/termux/extrakeys/ExtraKeysView.java
+@@ -7,6 +7,7 @@ import android.os.Handler;
+ import android.os.Looper;
+ import android.provider.Settings;
+ import android.util.AttributeSet;
++import android.util.TypedValue;
+ 
+ import java.util.ArrayList;
+ import java.util.List;
+@@ -414,6 +415,10 @@ public final class ExtraKeysView extends GridLayout {
+                 button.setAllCaps(mButtonTextAllCaps);
+                 button.setPadding(0, 0, 0, 0);
+ 
++                final boolean isLargeKey = isLargeKey(buttonInfo);
++                if (isLargeKey)
++                    button.setTextSize(TypedValue.COMPLEX_UNIT_PX, button.getTextSize() * LARGE_KEY_TEXT_SCALE);
++
+                 button.setOnClickListener(view -> {
+                     performExtraKeyButtonHapticFeedback(view, buttonInfo, button);
+                     onAnyExtraKeyButtonClick(view, buttonInfo, button);
+@@ -477,7 +482,7 @@ public final class ExtraKeysView extends GridLayout {
+                     param.height = 0;
+                 }
+                 param.setMargins(0, 0, 0, 0);
+-                param.columnSpec = GridLayout.spec(col, GridLayout.FILL, 1.f);
++                param.columnSpec = GridLayout.spec(col, GridLayout.FILL, isLargeKey ? LARGE_KEY_COLUMN_WEIGHT : 1.f);
+                 param.rowSpec = GridLayout.spec(row, GridLayout.FILL, 1.f);
+                 button.setLayoutParams(param);
+ 
+@@ -624,6 +629,19 @@ public final class ExtraKeysView extends GridLayout {
+ 
+ 
+ 
++    /** Text size multiplier for the {@link #isLargeKey(ExtraKeyButton)} keys. */
++    public static final float LARGE_KEY_TEXT_SCALE = 1.8f;
++    /** Column width weight for the {@link #isLargeKey(ExtraKeyButton)} keys; other keys use 1. */
++    public static final float LARGE_KEY_COLUMN_WEIGHT = 1.5f;
++
++    /**
++     * Check whether a {@link ExtraKeyButton} is the sessions drawer or keyboard toggle key, which
++     * stay usable when the soft keyboard is stuck and so are drawn larger than the other keys.
++     */
++    public boolean isLargeKey(ExtraKeyButton button) {
++        return !button.isMacro() && ("DRAWER".equals(button.getKey()) || "KEYBOARD".equals(button.getKey()));
++    }
++
+     /** Check whether a {@link ExtraKeyButton} is a {@link SpecialButton}. */
+     public boolean isSpecialButton(ExtraKeyButton button) {
+         return mSpecialButtonsKeys.contains(button.getKey());

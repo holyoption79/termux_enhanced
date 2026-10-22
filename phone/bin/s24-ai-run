@@ -1,0 +1,29 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Run an AI CLI that lives in the proot Debian (claude, codex, opencode).
+# Installed as $PREFIX/bin/s24-ai-run; claude/codex/opencode are symlinks to it.
+#
+# The Termux home is bound to /root, so ~/.claude, ~/.codex, ~/.config/opencode
+# and ~/.local/share/opencode are the same files you edit over Tailscale SSH.
+# Extra environment (one VAR=value per line) comes from ~/.config/s24-ai/env.
+set -u
+
+tool=$(basename "$0")
+[ "$tool" = s24-ai-run ] && { tool=${1:?usage: s24-ai-run TOOL [ARGS...]}; shift; }
+
+# Map the current Termux directory into the bound home; anything else starts in /root.
+case "$PWD" in
+	"$HOME"/*) wd="/root${PWD#"$HOME"}" ;;
+	*) wd=/root ;;
+esac
+
+# ~/.opencode/bin holds OpenCode 2 (npm only ships OpenCode 1); ~/.local/bin is where
+# self-updating CLIs put their binaries.
+envs=(--env "TERM=${TERM:-xterm-256color}" --env COLORTERM=truecolor --env LANG=C.UTF-8
+	--env "PATH=/root/.opencode/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+if [ -f "$HOME/.config/s24-ai/env" ]; then
+	while IFS= read -r line; do
+		case "$line" in '' | '#'*) ;; *=*) envs+=(--env "$line") ;; esac
+	done < "$HOME/.config/s24-ai/env"
+fi
+
+exec proot-distro login debian --bind "$HOME:/root" --shared-tmp --work-dir "$wd" "${envs[@]}" -- "$tool" "$@"

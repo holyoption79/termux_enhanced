@@ -1,0 +1,133 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# sk - close Termux terminal sessions without needing the keyboard.
+#
+#   sk              tappable menu of the other sessions (needs a terminal)
+#   sk list         print the other sessions
+#   sk kill N|PID   close one session (N = number shown by "sk list")
+#   sk all          close every other session
+#
+# A session is closed by SIGKILLing its foreground job, then sending SIGUSR1 to
+# its shell. ~/.bashrc traps USR1 as "exit 0", and Termux removes a session whose
+# shell exits 0, so no "[Process completed]" screen is left behind. Shells that
+# predate the trap, or ignore it, are SIGKILLed instead.
+set -u
+
+# stat_field PID N -> field N of /proc/PID/stat (1-based, as in proc(5))
+stat_field() {
+	local s
+	s=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+	s=${s##*) }
+	set -- $s "$2"
+	local n=${!#}
+	shift $((n - 3))
+	echo "$1"
+}
+
+# One pass over /proc: "pid ppid tty_nr tpgid comm" per process. Spawning a
+# process per pid is slow here (every exec goes through linker64).
+snapshot() {
+	cat /proc/[0-9]*/stat 2>/dev/null | awk '{
+		match($0, /\(.*\)/); comm = substr($0, RSTART + 1, RLENGTH - 2)
+		rest = substr($0, RSTART + RLENGTH + 1); split(rest, f, " ")
+		gsub(/ /, "_", comm); print $1, f[2], f[5], f[6], comm
+	}'
+}
+
+# Session shells are children of the Termux app that own a terminal. Android
+# hides the app process from /proc inside Termux, so "parent invisible" counts
+# as the app too. Prints "SELF <pid>" for the session sk itself runs under
+# (none over SSH), then one line per other session.
+classify() {
+	snapshot | awk -v me=$$ '
+		{ ppid[$1] = $2; tty[$1] = $3; comm[$1] = $5 }
+		function is_session(p) { return ppid[p] > 1 && (!(ppid[p] in ppid) || comm[ppid[p]] == "com.termux") }
+		END {
+			for (p = me; p > 1 && (p in ppid); p = ppid[p])
+				if (is_session(p)) { self = p; print "SELF", p; break }
+			for (p in ppid)
+				if (tty[p] != 0 && is_session(p) && p != self) print p
+		}'
+}
+
+sessions() { classify | grep -v '^SELF' | sort -n; }
+
+describe() {
+	local p=$1 tty fg what age
+	tty=$(readlink "/proc/$p/fd/0" 2>/dev/null); tty=${tty#/dev/}
+	age=$(ps -o etime= -p "$p" 2>/dev/null | tr -d ' ')
+	fg=$(stat_field "$p" 8)
+	if [ -z "$fg" ] || [ "$fg" -le 0 ] || [ "$fg" = "$p" ]; then
+		what="(idle)"
+	else
+		# The Play build execs through linker64, which repeats the binary path as argv[1].
+		what=$(tr '\0' ' ' < "/proc/$fg/cmdline" 2>/dev/null |
+			sed -E 's# /data/data/com\.termux/files/usr/(bin|libexec)/[^ ]+##' | cut -c1-40)
+		[ -n "$what" ] || what="pgid $fg"
+	fi
+	echo "${tty:-?} ${age:-?} $what"
+}
+
+close_session() {
+	local p=$1 fg i
+	fg=$(stat_field "$p" 8)
+	if [ -n "$fg" ] && [ "$fg" -gt 0 ] && [ "$fg" != "$p" ]; then
+		kill -KILL -- "-$fg" 2>/dev/null
+	fi
+	kill -USR1 "$p" 2>/dev/null
+	for i in 1 2 3 4 5 6 7 8 9 10; do
+		kill -0 "$p" 2>/dev/null || { echo "closed pid $p"; return 0; }
+		sleep 0.2
+	done
+	kill -KILL "$p" 2>/dev/null
+	echo "pid $p force-killed (tap ⏎ in that session to dismiss it)"
+}
+
+list() {
+	local n=0 p
+	for p in $(sessions); do
+		n=$((n + 1))
+		printf '%2d) pid %-6s %s\n' "$n" "$p" "$(describe "$p")"
+	done
+	[ "$n" -gt 0 ] || echo "no other sessions"
+}
+
+resolve() {
+	local want=$1 n=0 p
+	for p in $(sessions); do
+		n=$((n + 1))
+		if [ "$want" = "$n" ] || [ "$want" = "$p" ]; then echo "$p"; return 0; fi
+	done
+	return 1
+}
+
+menu() {
+	local args=() p choice
+	for p in $(sessions); do args+=("$p" "$(describe "$p")"); done
+	if [ ${#args[@]} -eq 0 ]; then echo "no other sessions"; return 0; fi
+	args+=(all "close all other sessions")
+	if command -v dialog >/dev/null 2>&1; then
+		choice=$(dialog --stdout --title "Close session" \
+			--menu "Tap a session (or use arrows + ⏎)" 0 0 0 "${args[@]}") || { clear; return 0; }
+		clear
+	else
+		list
+		read -r -p "number / pid / all (empty = cancel): " choice || return 0
+		[ -n "$choice" ] || return 0
+		[ "$choice" = all ] || choice=$(resolve "$choice") || { echo "no such session"; return 1; }
+	fi
+	if [ "$choice" = all ]; then
+		for p in $(sessions); do close_session "$p"; done
+	else
+		close_session "$choice"
+	fi
+}
+
+case "${1:-}" in
+	"")   if [ -t 0 ] && [ -t 1 ]; then menu; else list; fi ;;
+	list) list ;;
+	kill) [ $# -ge 2 ] || { echo "usage: sk kill N|PID" >&2; exit 2; }
+	      p=$(resolve "$2") || { echo "no such session: $2" >&2; exit 1; }
+	      close_session "$p" ;;
+	all)  for p in $(sessions); do close_session "$p"; done ;;
+	*)    sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

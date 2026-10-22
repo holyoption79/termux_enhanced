@@ -1,0 +1,2 @@
+# Scripts and configs run on Android and Linux: keep LF line endings even in Windows checkouts.
+* text=auto eol=lf
