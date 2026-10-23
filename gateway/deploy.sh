@@ -46,9 +46,10 @@ cd "$DEST" && python3 test_gateway.py
 cat <<EOF
 
 == client config (any node on the tailnet)
+  ssh does not forward environment, so the token rides as a remote assignment:
   "s24": {
     "command": "ssh",
-    "args": ["llmmaster", "python3", "$DEST/s24-gateway.py"],
-    "env": { "S24_GATEWAY_TOKEN": "<token above>" }
+    "args": ["llmmaster", "S24_GATEWAY_TOKEN=<token above> python3 $DEST/s24-gateway.py"],
+    "timeout": 60000
   }
 EOF

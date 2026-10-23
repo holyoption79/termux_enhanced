@@ -65,10 +65,16 @@ whatever node should hold the phone:
 ```jsonc
 "s24": {
   "command": "ssh",
-  "args": ["llmmaster", "python3", "/home/you/s24-gateway/s24-gateway.py"],
-  "env": { "S24_GATEWAY_TOKEN": "<the token deploy printed>" }
+  "args": ["llmmaster", "S24_GATEWAY_TOKEN=<the token deploy printed> python3 /home/you/s24-gateway/s24-gateway.py"],
+  "timeout": 60000
 }
 ```
+
+The token has to ride as a remote assignment: `ssh` forwards no environment, so
+`env: { S24_GATEWAY_TOKEN: ... }` never reaches the server and every client
+silently lands in `read` (it fails closed, `whoami` tells you the truth). Give
+the client a timeout — a cold SSH plus a phone round trip is seconds, and an
+untimed MCP client will sit there.
 
 SSH-stdio means no new listening port: the node needs only SSH to llmmaster,
 which every fleet node already has. A client that cannot spawn a process needs

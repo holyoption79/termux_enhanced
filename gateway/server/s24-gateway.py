@@ -95,7 +95,13 @@ def _load_tokens() -> dict:
 
 
 def identify() -> Ctx:
-    """Bind this process to a token from the environment. Unknown tokens get read."""
+    """Bind this process to a token from the environment. Unknown tokens get read.
+
+    Over the SSH-stdio transport, ssh forwards no environment: the token has to
+    be assigned on the remote command line (`S24_GATEWAY_TOKEN=x python3 ...`).
+    A client that forgets lands here with no token and gets read, which is the
+    safe direction.
+    """
     tok = os.environ.get("S24_GATEWAY_TOKEN", "").strip()
     if not tok:
         return CTX
@@ -235,12 +241,14 @@ def device_state() -> dict:
     except Exception as e:
         out["windows"] = f"err {e}"
     try:
-        b = adb_text("dumpsys battery | tr '\\n' ' '")
-        out["battery"] = {k: v.strip() for k, v in (p.split(":", 1) for p in b.split(";") if ":" in p)}
+        keep = ("AC powered", "USB powered", "Wireless powered", "level", "status", "voltage", "temperature", "technology")
+        rows = [p.split(":", 1) for p in adb_text("dumpsys battery | head -20").splitlines() if ":" in p]
+        out["battery"] = {k.strip(): v.strip() for k, v in rows if k.strip() in keep}
     except Exception as e:
         out["battery"] = f"err {e}"
     try:
-        out["screen"] = adb_text("wm size; wm orientation")
+        # 'wm orientation' does not exist on this device and takes the whole read down with it.
+        out["screen"] = adb_text("wm size; dumpsys input | grep -m1 SurfaceOrientation; dumpsys display | grep -m1 mDefaultMode")
     except Exception as e:
         out["screen"] = f"err {e}"
     try:
