@@ -18,15 +18,25 @@
 set -u
 PREFIX=${PREFIX:-/data/data/com.termux/files/usr}
 CACHE=${TMPDIR:-$PREFIX/tmp}/.s24-adbx-port
+MODEL=${S24_ADBX_MODEL:-SM-S928N}
 
-probe() { # probe PORT -> ok when adbd on that loopback port answers
+probe() { # probe PORT -> ok when adbd on that loopback port answers as ours.
+	# get-state lies "offline" from a stale server after a reboot; the honest
+	# test is connect + a real shell read, and a dead server must answer fresh.
 	local s
-	s=$(timeout 6 adb -s "127.0.0.1:$1" get-state 2>/dev/null) || return 1
-	[ "$s" = device ]
+	s=$(timeout 8 adb -s "127.0.0.1:$1" shell getprop ro.product.model 2>/dev/null)
+	[ "$s" = "$MODEL" ] && return 0
+	adb connect "127.0.0.1:$1" >/dev/null 2>&1
+	s=$(timeout 8 adb -s "127.0.0.1:$1" shell getprop ro.product.model 2>/dev/null)
+	[ "$s" = "$MODEL" ] && return 0
+	adb kill-server >/dev/null 2>&1
+	adb connect "127.0.0.1:$1" >/dev/null 2>&1
+	s=$(timeout 8 adb -s "127.0.0.1:$1" shell getprop ro.product.model 2>/dev/null)
+	[ "$s" = "$MODEL" ]
 }
 
 discover() { # prints a live adbd loopback port; scans only when cache is dead
-	local p port wave
+	local p port
 	port=
 	[ -f "$CACHE" ] && read -r port <"$CACHE" 2>/dev/null
 	port=${port:-}
