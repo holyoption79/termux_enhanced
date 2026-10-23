@@ -198,6 +198,18 @@ def adb_text(cmd: str, timeout: float = TIMEOUT) -> str:
     return adb(cmd, timeout=timeout).decode("utf-8", "replace").strip()
 
 
+def termux(cmd: str, timeout: float = TIMEOUT) -> str:
+    """Run in Termux itself, not in adb shell. This is the only way to reach the
+    phone's own agents (s24-ai-run -> claude/codex/opencode in proot), its home
+    directory and its sshd: adb shell is uid=2000 and cannot see them."""
+    argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", SSH_HOST, cmd]
+    p = subprocess.run(argv, capture_output=True, timeout=timeout)
+    out = p.stdout.decode("utf-8", "replace").strip()
+    if p.returncode != 0:
+        raise RuntimeError((p.stderr.decode("utf-8", "replace").strip() or f"termux exit {p.returncode}"))
+    return out
+
+
 # -------------------------------------------------------------------- lock
 def acquire(tool: str) -> str:
     """One actor at a time. Returns the holder label; raises if busy."""
@@ -645,6 +657,150 @@ def grant(package: str, permission: str, confirm: bool = True) -> str:
     need("admin")
     cmd = f"pm grant {package} {permission}"
     return guarded("grant", cmd, confirm, {"p": package, "perm": permission}, lambda: adb_text(cmd))
+
+
+@app.tool()
+def exec_out(command: str) -> dict:
+    """Binary-safe 'adb exec-out' (screencap -p, tar of a path, anything where a
+    CRLF translation would corrupt the bytes). Read tier for reads, gated like
+    everything else. Saved on llmmaster, not streamed into the client."""
+    need("read")
+    t0 = time.time()
+    cmd = " ".join(command.split())
+    verdict = classify(cmd)
+    if verdict == "blocked":
+        return {"blocked": f"would sever the gateway path: {cmd}"}
+    if verdict == "confirm":
+        return {"needs": f"confirm is not accepted here; run '{cmd}' through shell instead"}
+    acquire("exec_out")
+    try:
+        raw = adb(cmd, binary=True)
+        p = Path(os.environ.get("S24_GATEWAY_OUT", "/tmp")) / f"s24-{int(t0 * 1000)}.bin"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(raw)
+        audit("exec_out", {"cmd": cmd}, True, f"{len(raw)} bytes -> {p}", int((time.time() - t0) * 1000))
+        return {"path": str(p), "bytes": len(raw)}
+    except Exception as e:
+        audit("exec_out", {"cmd": cmd}, False, str(e), int((time.time() - t0) * 1000))
+        raise
+
+
+@app.tool()
+def long_press(x: int, y: int, ms: int = 700) -> str:
+    """Hold a point. Same zero-distance swipe the OS uses; ms is the hold length."""
+    need("act")
+    t0 = time.time()
+    r = adb_text(f"input swipe {int(x)} {int(y)} {int(x)} {int(y)} {int(ms)}")
+    audit("long_press", {"x": x, "y": y, "ms": ms}, True, r or "sent", int((time.time() - t0) * 1000))
+    return r or "sent"
+
+
+@app.tool()
+def drag(x1: int, y1: int, x2: int, y2: int, ms: int = 400) -> str:
+    """Slow, deliberate move: reorder a home-screen icon, drag a widget, scrub a
+    slider. Fast flicks belong to swipe."""
+    need("act")
+    t0 = time.time()
+    r = adb_text(f"input swipe {int(x1)} {int(y1)} {int(x2)} {int(y2)} {int(ms)}")
+    audit("drag", {"a": [x1, y1], "b": [x2, y2]}, True, r or "sent", int((time.time() - t0) * 1000))
+    return r or "sent"
+
+
+@app.tool()
+def clipboard(op: str = "get", text: str = "") -> str:
+    """The phone's clipboard. op=get reads (needs nothing); op=set writes and is
+    act tier. Beware: whatever was last copied can be a card number or password."""
+    need("read" if op == "get" else "act")
+    t0 = time.time()
+    cmd = "cmd clipboard get" if op == "get" else f"cmd clipboard set {shlex.quote(text)}"
+    r = _call(lambda: adb_text(f"{cmd} || echo 'cmd clipboard unsupported'"), "clipboard", {"op": op}, t0)
+    return r
+
+
+@app.tool()
+def content_query(uri: str, projection: str = "", where: str = "") -> str:
+    """Query a content provider as the shell user: contacts, SMS inbox, media,
+    settings. Read tier."""
+    need("read")
+    t0 = time.time()
+    cmd = f"content query --uri {shlex.quote(uri)}"
+    if projection:
+        cmd += f" --projection {shlex.quote(projection)}"
+    if where:
+        cmd += f' --where {shlex.quote(where)}'
+    return _call(lambda: adb_text(f"{cmd} || true"), "content_query", {"uri": uri}, t0)
+
+
+@app.tool()
+def content_write(uri: str, values: str = "", op: str = "insert") -> str:
+    """content insert/update/delete against a provider. act tier, and it changes
+    real user data, so state the values deliberately."""
+    need("act")
+    t0 = time.time()
+    cmd = f"content {op} --uri {shlex.quote(uri)}"
+    if values:
+        cmd += f" --values {shlex.quote(values)}"
+    return _call(lambda: adb_text(cmd), "content_write", {"uri": uri, "op": op}, t0)
+
+
+@app.tool()
+def termux_run(command: str, timeout: int = 60) -> str:
+    """Run in Termux itself, not adb shell: the phone's home directory, its files,
+    sshd, proot-distro. This is the layer adb shell (uid=2000) cannot see, which
+    is why the phone's own state lives here. read tokens get reads only."""
+    need("read")
+    cmd = " ".join(command.split())
+    if CTX.tier == "read":
+        writes = ("proot-distro install", "apt ", "pkg install", "npm i", "ssh ", "sshd", "tee ", ">", "mv ", "rm ", "cp ")
+        if cmd.startswith(writes):
+            return f"read tier cannot run '{cmd}'; ask for act"
+    return guarded("termux_run", cmd, False, {"cmd": cmd}, lambda: termux(cmd, timeout=min(float(timeout), 300.0)))
+
+
+@app.tool()
+def agent_run(agent: str, args: str, timeout: int = 180) -> dict:
+    """Drive an AI CLI running on the phone: claude, codex, opencode. It is
+    's24-ai-run <agent> <args>' inside proot Debian, with the Termux home bound to
+    /root, so ~/.claude, ~/.codex and ~/.config/opencode are the credentials and
+    history you already have there. Pass each CLI's own print flags in args, e.g.
+    args='-p \"summarise ~/notes\"' for claude, or 'exec \"...\"' for codex.
+
+    This spends the owner's API quota and reads their agent history files. act
+    tier, one actor at a time, audited like every other call."""
+    need("act")
+    if agent not in ("claude", "codex", "opencode"):
+        return {"err": f"agent must be claude, codex or opencode, not {agent!r}"}
+    t0 = time.time()
+    acquire(f"agent_run:{agent}")
+    try:
+        out = termux(f"s24-ai-run {agent} {args}", timeout=min(float(timeout), 600.0))
+        audit("agent_run", {"agent": agent, "args": args[:200]}, True, out[:400], int((time.time() - t0) * 1000))
+        return {"agent": agent, "reply": out}
+    except Exception as e:
+        audit("agent_run", {"agent": agent, "args": args[:200]}, False, str(e)[:400], int((time.time() - t0) * 1000))
+        return {"agent": agent, "err": f"{type(e).__name__}: {str(e)[:300]}",
+                "note": "the agent needs its own login (claude/codex/opencode auth) in Termux home"}
+
+
+@app.tool()
+def boot_script(op: str = "list", name: str = "", body: str = "", confirm: bool = False) -> str:
+    """The phone's ~/.termux/boot scripts - what Termux:Boot runs on every boot.
+    This is where adb bring-up belongs (op=list reads, op=write is admin +
+    confirm). Writing it does not run it; the next boot does.
+
+    A reboot still drops 'adb tcpip 5555' and a shell cannot restart adbd, so a
+    script here only reconnects what is already listening: pair it with the
+    owner's Wireless Debugging toggle, which survives reboots, or it will fail
+    exactly as the raw ensure does."""
+    need("read" if op == "list" else "admin")
+    t0 = time.time()
+    if op == "list":
+        return _call(lambda: termux("ls -l ~/.termux/boot/ 2>&1; for f in ~/.termux/boot/*; do echo \"--- $f\"; cat \"$f\"; done 2>&1 | head -60"),
+                     "boot_script", {"op": op}, t0)
+    if not name.endswith((".sh", "")) or "/" in name:
+        return {"err": "name must be a bare filename"}
+    return guarded("boot_script", f"boot {name}", confirm, {"op": op, "name": name},
+                   lambda: termux(f"cat > ~/.termux/boot/{name} <<'EOF'\n{body}\nEOF\nchmod 700 ~/.termux/boot/{name} && echo written"))
 
 
 @app.tool()

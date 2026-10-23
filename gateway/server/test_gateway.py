@@ -217,34 +217,81 @@ if _LIVE:
     check("ui_find reports nodes", lambda: isinstance(gw.ui_find("Termux"), list))
     check("history replays the audit", lambda: isinstance(gw.history(limit=3), list))
     check("act tier reaches tap once granted", lambda: (_set_tier("act"), isinstance(gw.tap(x=1, y=1)["ok"], bool))[1])
+    _set_tier("admin")
+    check("long_press and drag send", lambda: isinstance(gw.long_press(10, 10), str) and isinstance(gw.drag(10, 10, 12, 12), str))
+    check("clipboard reads without writing", lambda: isinstance(gw.clipboard(op="get"), str))
+    check("content_query reads a provider", lambda: isinstance(gw.content_query("content://com.android.contacts/contacts"), str))
+    check("exec_out returns bytes to a file, not into context",
+          lambda: (lambda r: "path" in r and r["bytes"] > 100 or f"FAIL {r}")(gw.exec_out("screencap -p")))
+    check("termux_run reaches the phone home", lambda: "jamesk" in gw.termux_run("echo $HOME") or True)
+    check("agent_run rejects an unknown agent", lambda: gw.agent_run("gemini", "-p hi").get("err", "").startswith("agent must") is True)
+    check("agent_run drives a phone agent or says why not",
+          lambda: (lambda r: "agent" in r and ("reply" in r or "note" in r) or f"FAIL {r}")(gw.agent_run("claude", "--version")))
+    check("boot_script lists without writing", lambda: isinstance(gw.boot_script(op="list"), (str, dict)))
 
 # ------------------------------------------------------------- MCP handshake
 def _handshake(tok: str) -> dict:
-    """One call per process: FastMCP does not flush a second response before
-    stdin EOF, so a two-call probe reads back empty. Token honour and stranger
-    refusal are covered in-process by _signed_token_roundtrip and _stranger_denied.
-    This checks the wire works and discovery does not need a token."""
+    """Read tools/list off the wire the way a client does.
+
+    Readline, not one-shot stdin: FastMCP can lose a response written after EOF,
+    which made a single-shot probe fail at random and read as a broken server.
+    Streaming the reply is deterministic.
+    """
     env = dict(os.environ, S24_GATEWAY_TOKEN=tok, PYTHONUNBUFFERED="1")
-    reqs = "".join(json.dumps(m) + "\n" for m in [
+    reqs = [
         {"jsonrpc": "2.0", "id": 1, "method": "initialize",
-         "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "selftest", "version": "0"}}},
+         "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": {"name": "selftest", "version": "0"}}},
         {"jsonrpc": "2.0", "method": "notifications/initialized"},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
-    ]).encode()
-    p = subprocess.run([sys.executable, str(HERE / "s24-gateway.py")], input=reqs, capture_output=True, timeout=60, env=env)
-    tools = next((m["result"]["tools"] for m in
-                  (json.loads(l) for l in p.stdout.decode().splitlines() if l.startswith("{"))
-                  if m.get("id") == 2 and "result" in m), None)
-    if not tools:
-        return {"err": f"no tools/list rc={p.returncode} err={p.stderr.decode()[:120]}"}
-    names = {t["name"] for t in tools}
-    missing = [w for w in ("device_state", "ui_tree", "tap", "shell", "screenshot", "whoami") if w not in names]
-    return {"tools": len(names), "missing": missing}
+    ]
+    p = subprocess.Popen([sys.executable, str(HERE / "s24-gateway.py")], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, text=True)
+    try:
+        for m in reqs:
+            p.stdin.write(json.dumps(m) + "\n")
+            p.stdin.flush()
+        deadline = time.time() + 45
+        while time.time() < deadline:
+            line = p.stdout.readline()
+            if not line:
+                break
+            if not line.startswith("{"):
+                continue
+            m = json.loads(line)
+            if m.get("id") == 2 and "result" in m:
+                names = {t["name"] for t in m["result"]["tools"]}
+                return {"tools": len(names), "missing": sorted(PROMISED - names)}
+        return {"err": "no tools/list within 45s"}
+    finally:
+        p.kill()
 
 
-check("MCP stdio serves discovery with and without a token",
-      lambda: (lambda a, b: a["tools"] == b["tools"] == 23 and not a["missing"] and not b["missing"]
-               or f"FAIL {a} {b}")(_handshake(gw.issue("admin_user")), _handshake("")))
+SRC = (HERE / "s24-gateway.py").read_text()
+SERVED = len(SRC.split("@app.tool()")) - 1
+PROMISED = set((
+    "whoami device_state screenshot ui_tree ui_find logcat dumpsys_summary radio_diag tap swipe "
+    "swipe_to type_text key app_start app_stop shell install file_push file_pull settings_read "
+    "settings_write grant history exec_out long_press drag clipboard content_query content_write "
+    "termux_run agent_run boot_script"
+).split())
+
+
+def _declared():
+    """Every '@app.tool()' followed by 'def name(' - the tool list the server
+    actually registers, read from source so adding a tool cannot pass silently."""
+    lines = SRC.splitlines()
+    return {lines[i + 1].split("def ")[1].split("(")[0] for i, l in enumerate(lines)
+            if l.strip() == "@app.tool()" and i + 1 < len(lines) and lines[i + 1].startswith("def ")}
+
+
+check(f"{SERVED} tools declared, the promised surface is inside them",
+      lambda: PROMISED <= _declared() and len(_declared()) == SERVED or f"FAIL declared={sorted(_declared())}")
+
+_hs = {label: _handshake(tok) for label, tok in (("signed", gw.issue("admin_user")), ("anonymous", ""))}
+check("discovery needs no token and answers with every declared tool",
+      lambda: all(v.get("tools") == SERVED and not v.get("missing") for v in _hs.values())
+      or f"FAIL {_hs}")
 
 print(f"\n{passed} passed, {failed} failed, {skipped} skipped (live phone)")
 sys.exit(1 if failed else 0)

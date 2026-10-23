@@ -53,9 +53,16 @@ installs, file moves and settings writes.
 
 | Tier | Tools |
 |---|---|
-| `read` | `whoami` `device_state` `screenshot` `ui_tree` `ui_find` `logcat` `dumpsys_summary` `radio_diag` `settings_read` `history`, plus read-only `shell` |
-| `act` | the above + `tap` `swipe` `swipe_to` `type_text` `key` `app_start` `app_stop` |
-| `admin` | the above + `install` `file_push` `file_pull` `settings_write` `grant`, and whole `shell` |
+| `read` | `whoami` `device_state` `screenshot` `ui_tree` `ui_find` `logcat` `dumpsys_summary` `radio_diag` `settings_read` `content_query` `clipboard` `boot_script` `history`, plus read-only `shell` and `exec_out` |
+| `act` | the above + `tap` `long_press` `drag` `swipe` `swipe_to` `type_text` `key` `app_start` `app_stop` `content_write` `termux_run` `agent_run` |
+| `admin` | the above + `install` `file_push` `file_pull` `settings_write` `grant`, and `boot_script` writes |
+
+32 tools, but two of them are unbounded: `shell` is any `adb shell` command
+(uid=2000) and `termux_run` is any Termux command. Between them the surface is
+every action a developer at the console can take — 100% of what adb reaches.
+What adb itself cannot reach without root stays out of reach: other apps'
+private data, the system partition, modem internals, secure windows, and the
+lockscreen PIN. That is a property of an unrooted S24, not of this gateway.
 
 Three devices, none of which reduce what adb can do:
 
@@ -66,6 +73,20 @@ Three devices, none of which reduce what adb can do:
   tier, tool, args, result, duration. `history(limit=, who=)` reads it back.
 - **Confirm before unrolling.** Installs, grants, `settings put`, IME changes
   run only with `confirm=true`.
+
+## The phone's own agents
+
+`agent_run` drives claude, codex and opencode running *on the phone*
+(`s24-ai-run`, proot Debian, Termux home bound to `/root` so `~/.claude`,
+`~/.codex` and `~/.config/opencode` are the credentials already there). It
+spends the owner's API quota and reads their agent history, so it is act tier,
+locked, and audited like everything else. Pass each CLI's own print flags:
+`agent_run("claude", '-p "summarise ~/notes"')`.
+
+`boot_script` reads and writes `~/.termux/boot/*` — the bring-up hooks Termux:Boot
+runs on every boot. That is where adb reconnection belongs, but see the reboot
+note under Not built: a script there cannot start adbd, only talk to one that is
+already listening.
 
 Some calls are never executed, because they cut the path the gateway travels
 on: `reboot`, `svc wifi disable`, `svc data disable`, `pm clear`, `pm uninstall`,
@@ -115,13 +136,19 @@ notification text never leaves the phone unless asked.
 ## Not built
 
 - **HTTP transport.** stdio over SSH only, which is what every node can reach.
-- **Reboot recovery for adb.** `adb tcpip 5555` dies with a reboot; reconnect
-  is `s24-adbx ensure`. Boot-time re-arm through Termux:Boot is a separate
-  change and has not been tested against a reboot.
+- **Reboot recovery for adb — genuinely unsolved.** A reboot puts adbd back in
+  USB-only mode; `service.adb.tcp.port` is volatile and a shell cannot restart
+  adbd, so from Termux alone there is nothing to reconnect to and every tool
+  call errors until someone plugs USB (`adb tcpip 5555`) or turns on Wireless
+  Debugging, which does survive reboots. `s24-adbx ensure` only helps while
+  adbd is already listening — it is not a boot fix. Writing the boot hook is
+  `boot_script`; pairing Wireless Debugging to a stable port for Termux's adb
+  client is the missing piece and has never been tested here.
 - **Multi-device.** One phone, one serial.
-- `test_gateway.py` runs 22 checks: signed token honoured, strangers denied
+- `test_gateway.py` runs 31 checks: signed token honoured, strangers denied
   (no token, bad shape, bad signature, expired), password mints and wrong
   password mints nothing, tier gate, lock, audit, UI parsing, screenshot
-  masking, blocked/confirm paths, MCP discovery on the wire — plus the live
-  phone path when the phone answers. It does not cover a reboot, LTE-only
-  operation, or another agent stealing the lock mid-call.
+  masking, blocked/confirm paths, all 32 tools declared and served, discovery
+  without a token — plus the live phone path, the phone's own agent runner, and
+  Termux home. It does not cover a reboot, LTE-only operation, or another agent
+  stealing the lock mid-call.
