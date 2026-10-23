@@ -1,4 +1,4 @@
-#!/data/data/com.termux/files/usr/bin/sh
+#!/data/data/com.termux/files/usr/bin/bash
 # s24-adbx - run adb against this phone's own adbd, for the s24 gateway.
 # Installed as $PREFIX/bin/s24-adbx. The gateway reaches it over SSH, so it works
 # on Wi-Fi, LTE or 5G as long as the phone is on the tailnet.
@@ -10,16 +10,67 @@
 #
 # Commands arrive base64-encoded so they pass through SSH and two shells unquoted.
 # Exit 69 (with an "s24-adbx:" message) means adb itself is unavailable.
+#
+# adbd lives on loopback and the port is NOT fixed: wireless debugging picks a
+# fresh port every boot and Termux's adb has no mDNS. So the wrapper scans
+# loopback once, caches the port, and re-scans only when the cache goes stale.
+# Requires Wireless debugging left ON; a manual `adb tcpip 5555` is found too.
 set -u
-SERIAL=127.0.0.1:5555
+PREFIX=${PREFIX:-/data/data/com.termux/files/usr}
+CACHE=${TMPDIR:-$PREFIX/tmp}/.s24-adbx-port
+
+probe() { # probe PORT -> ok when adbd on that loopback port answers
+	local s
+	s=$(timeout 6 adb -s "127.0.0.1:$1" get-state 2>/dev/null) || return 1
+	[ "$s" = device ]
+}
+
+discover() { # prints a live adbd loopback port; scans only when cache is dead
+	local p port wave
+	port=
+	[ -f "$CACHE" ] && read -r port <"$CACHE" 2>/dev/null
+	port=${port:-}
+	if [ -n "$port" ] && probe "$port" >/dev/null 2>&1; then
+		printf '%s\n' "$port"
+		return 0
+	fi
+	# loopback sweep in one python pass (500-fork bash storms are too slow on
+	# the phone); probe each opener, first real adbd wins and gets cached.
+	local p
+	rm -f "$CACHE.raw"
+	python3 - >"$CACHE.raw" 2>/dev/null <<'PY'
+import socket
+import concurrent.futures as cf
+def chk(p):
+	try:
+		socket.create_connection(("127.0.0.1", p), 0.25).close()
+		return p
+	except Exception:
+		return None
+ports = [5555] + list(range(30000, 55001))
+with cf.ThreadPoolExecutor(3000) as ex:
+	for r in ex.map(chk, ports):
+		if r:
+			print(r)
+PY
+	for p in $(sort -n "$CACHE.raw" 2>/dev/null); do
+		if probe "$p" >/dev/null 2>&1; then
+			printf '%s\n' "$p" >"$CACHE"
+			rm -f "$CACHE.raw"
+			printf '%s\n' "$p"
+			return 0
+		fi
+	done
+	rm -f "$CACHE.raw"
+	return 1
+}
 
 ensure() {
-	state=$(adb -s "$SERIAL" get-state 2>/dev/null)
-	if [ "$state" != device ]; then
-		adb connect "$SERIAL" >/dev/null 2>&1
-		state=$(adb -s "$SERIAL" get-state 2>&1)
-	fi
-	[ "$state" = device ] || { echo "s24-adbx: local adbd is not usable: ${state:-offline}" >&2; exit 69; }
+	local port
+	port=$(discover) || { echo "s24-adbx: no local adbd listener - leave Wireless debugging ON" >&2; exit 69; }
+	SERIAL="127.0.0.1:$port"
+	adb -s "$SERIAL" get-state >/dev/null 2>&1 || adb connect "$SERIAL" >/dev/null 2>&1
+	probe "$port" || { echo "s24-adbx: local adbd is not usable on $SERIAL" >&2; exit 69; }
 }
 
 case "${1:-}" in
