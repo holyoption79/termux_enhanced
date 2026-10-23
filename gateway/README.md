@@ -20,15 +20,34 @@ Termux adb -> the phone's own adbd -> uid=2000(shell)
 | File | Installs to | Purpose |
 |---|---|---|
 | `phone/s24-adbx` | `$PREFIX/bin/` on the phone | Runs adb against `127.0.0.1:5555`; takes commands base64-encoded so they survive SSH plus two shells |
-| `server/s24-gateway.py` | `~/s24-gateway/` on llmmaster | The MCP server: tiers, lock, audit, tools |
-| `server/tokens.json` | `~/s24-gateway/` | token -> `{name, tier}`, edited by hand |
-| `server/test_gateway.py` | `~/s24-gateway/` | Selftest: logic, live phone path, MCP handshake |
-| `server/probe_client.py` | `~/s24-gateway/` | Talks to the running server the way a real MCP client does: real tokens, tier checks, confirm/blocked paths |
-| `deploy.sh` | run on llmmaster | Installs all of the above, mints tokens, selftests |
+| `server/s24-gateway.py` | `~/s24-gateway/` on llmmaster | The MCP server: signed-token auth, tiers, lock, audit, tools |
+| `server/issue.py` | `~/s24-gateway/` | Mint a token after a password check; add, revoke, rotate users |
+| `server/test_gateway.py` | `~/s24-gateway/` | Selftest: auth paths, tier gate, live phone, MCP wire |
+| `server/probe_client.py` | `~/s24-gateway/` | Talks to the running server the way a real MCP client does |
+| `deploy.sh` | run on llmmaster | Installs the above, creates `secret.key`, selftests |
+
+`users.json` and `secret.key` are runtime state on llmmaster, not in the repo.
+`secret.key` is chmod 600: rotate it and every live token dies at once.
+
+## Auth
+
+A caller presents a signed token: `user.expiry.signature`, HMAC-SHA256 over
+`user.expiry` with `secret.key`. No token, wrong signature, expired, or an
+unknown user: denied outright, every tier. There is no read-only path for
+strangers, because screen text, notifications and logcat are the owner's data
+and a gateway that hands them to whoever connects cannot be left running.
+
+Mint tokens on llmmaster, password required, password never sent to clients:
+
+```bash
+python3 ~/s24-gateway/issue.py add <name> <read|act|admin> [ttl_days]
+python3 ~/s24-gateway/issue.py <name>     # verify password, print a token
+python3 ~/s24-gateway/issue.py revoke <name>
+```
 
 ## Tiers
 
-Every token gets one tier, and the tier decides the tool list, not the mood of
+A token carries one tier and the tier decides the tool list, not the mood of
 the caller. `read` sees state, `act` adds input and apps, `admin` adds
 installs, file moves and settings writes.
 
@@ -59,22 +78,30 @@ command, so the caller can report it to a human.
 scp -r gateway llmmaster:~/s24-gateway-tmp && ssh llmmaster 'cd ~/s24-gateway-tmp && bash deploy.sh'
 ```
 
-`deploy.sh` ends by printing a client block. Paste it into the MCP config of
-whatever node should hold the phone:
+`deploy.sh` installs the server, creates `secret.key` once (chmod 600, never
+printed, rotating it invalidates every token), runs the selftest, and skips the
+wrapper install if the phone is asleep. It does not mint tokens — you do that,
+so passwords never pass through a deployment log:
+
+```bash
+ssh llmmaster 'python3 ~/s24-gateway/issue.py add <name> admin 90'
+ssh llmmaster 'python3 ~/s24-gateway/issue.py <name>'      # prints the token
+```
+
+Put that in the MCP config of whatever node should hold the phone:
 
 ```jsonc
 "s24": {
   "command": "ssh",
-  "args": ["llmmaster", "S24_GATEWAY_TOKEN=<the token deploy printed> python3 /home/you/s24-gateway/s24-gateway.py"],
+  "args": ["llmmaster", "S24_GATEWAY_TOKEN=<name.expiry.signature> python3 /home/you/s24-gateway/s24-gateway.py"],
   "timeout": 60000
 }
 ```
 
 The token has to ride as a remote assignment: `ssh` forwards no environment, so
-`env: { S24_GATEWAY_TOKEN: ... }` never reaches the server and every client
-silently lands in `read` (it fails closed, `whoami` tells you the truth). Give
-the client a timeout — a cold SSH plus a phone round trip is seconds, and an
-untimed MCP client will sit there.
+`env: { S24_GATEWAY_TOKEN: ... }` never reaches the server and the client is
+denied every call. Give the client a timeout — a cold SSH plus a phone round
+trip is seconds, and an untimed MCP client will sit there.
 
 SSH-stdio means no new listening port: the node needs only SSH to llmmaster,
 which every fleet node already has. A client that cannot spawn a process needs
@@ -92,6 +119,9 @@ notification text never leaves the phone unless asked.
   is `s24-adbx ensure`. Boot-time re-arm through Termux:Boot is a separate
   change and has not been tested against a reboot.
 - **Multi-device.** One phone, one serial.
-- `test_gateway.py` covers gating, lock, audit, parsing, handshake, and — when
-  the phone is reachable — the live path. It does not cover a reboot, LTE-only
+- `test_gateway.py` runs 22 checks: signed token honoured, strangers denied
+  (no token, bad shape, bad signature, expired), password mints and wrong
+  password mints nothing, tier gate, lock, audit, UI parsing, screenshot
+  masking, blocked/confirm paths, MCP discovery on the wire — plus the live
+  phone path when the phone answers. It does not cover a reboot, LTE-only
   operation, or another agent stealing the lock mid-call.
