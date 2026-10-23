@@ -18,7 +18,8 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-os.environ.setdefault("S24_GATEWAY_TOKENS", str(HERE / "tokens.json"))
+os.environ.setdefault("S24_GATEWAY_USERS", str(HERE / "selftest-out" / "users.json"))
+os.environ.setdefault("S24_GATEWAY_SECRET", str(HERE / "selftest-out" / "secret.key"))
 os.environ.setdefault("S24_GATEWAY_AUDIT", str(HERE / "selftest-out"))
 os.environ.setdefault("S24_GATEWAY_LOCK", str(HERE / "selftest-out" / "lock.json"))
 (HERE / "selftest-out").mkdir(exist_ok=True)
@@ -50,16 +51,29 @@ def check(name: str, fn):
 class SkipTest(Exception):
     pass
 
-
 spec = importlib.util.spec_from_file_location("gw", HERE / "s24-gateway.py")
 gw = importlib.util.module_from_spec(spec)
 sys.modules["gw"] = gw  # @dataclass resolves cls.__module__ through sys.modules
 spec.loader.exec_module(gw)
 print("s24-gateway selftest")
 
+# A self-contained key and user file: auth is tested against these, not against
+# whatever the deployment happens to hold.
+OUT = HERE / "selftest-out"
+OUT.mkdir(exist_ok=True)
+if not (OUT / "secret.key").exists():
+    (OUT / "secret.key").write_bytes(bytes.fromhex("a3" * 32).hex().encode())
+    (OUT / "secret.key").write_text("a3" * 32)
+(OUT / "users.json").write_text(json.dumps({
+    "admin_user": {"pass": gw.pass_hash("correct horse"), "tier": "admin", "ttl_days": 1},
+    "read_user": {"pass": gw.pass_hash("correct horse"), "tier": "read", "ttl_days": 1},
+    "stale_user": {"pass": gw.pass_hash("correct horse"), "tier": "admin", "ttl_days": -1},
+}))
+gw.USERS, gw.SECRET = OUT / "users.json", OUT / "secret.key"
+
 # ---------------------------------------------------------------- pure logic
 check("module imports", lambda: True)
-check("tokens.json parses", lambda: len(json.loads((HERE / "tokens.json").read_text())) >= 2)
+check("users.json has the fixture users", lambda: len(gw._users()) == 3)
 
 check(
     "classify blocks connection-severing calls",
@@ -73,19 +87,69 @@ check("classify leaves reads free", lambda: all(gw.classify(c) == "free" for c i
 
 
 def _tier_gate():
+    gw.CTX.name, gw.CTX.tier, gw.CTX.deny = "admin_user", "admin", ""
+    gw.need("admin")
     gw.CTX.tier = "read"
     try:
         gw.need("act")
         return "read was allowed to act"
     except gw.TierError:
         pass
-    gw.CTX.tier = "admin"
-    gw.need("admin")
-    gw.CTX.tier = "read"
+    gw.CTX.name = ""
     return True
 
 
 check("tier gate stops read at act, lets admin through", _tier_gate)
+
+
+def _stranger_denied():
+    """No token, bad signature, expired: all three deny every tier."""
+    import importlib as _il
+    for label, tok in (("no token", ""), ("bad shape", "james.999"), ("bad sig", "james.9999999999.deadbef")):
+        os.environ["S24_GATEWAY_TOKEN"] = tok
+        c = gw.identify()
+        if not c.deny:
+            return f"FAIL {label} was let through"
+        try:
+            gw.need("read")
+            return f"FAIL {label} reached read"
+        except gw.TierError:
+            pass
+    del os.environ["S24_GATEWAY_TOKEN"]
+    return True
+
+
+check("strangers get nothing, not even read", _stranger_denied)
+
+
+def _signed_token_roundtrip():
+    """Password in, token out. Wrong password out. Expired user out. Signed
+    token for a known user in, tier set, deny cleared."""
+    for pw, want_ok in (("correct horse", True), ("wrong horse", False)):
+        import subprocess
+        r = subprocess.run([sys.executable, str(HERE / "issue.py"), "read_user"],
+                           capture_output=True, text=True, timeout=30,
+                           env=dict(os.environ, S24_GATEWAY_PASSWORD=pw,
+                                    S24_GATEWAY_USERS=str(OUT / "users.json"),
+                                    S24_GATEWAY_SECRET=str(OUT / "secret.key")))
+        got_ok = r.returncode == 0 and (r.stdout.strip().count(".") == 2)
+        if got_ok != want_ok:
+            return f"FAIL pw={pw!r} rc={r.returncode} out={r.stdout[:60]!r}"
+    admin_tok = gw.issue("admin_user")
+    stale_tok = gw.issue("stale_user")
+    os.environ["S24_GATEWAY_TOKEN"] = admin_tok
+    if gw.identify().deny or gw.CTX.tier != "admin":
+        return "FAIL signed token not honoured"
+    os.environ["S24_GATEWAY_TOKEN"] = stale_tok
+    c = gw.identify()
+    if "expired" not in c.deny:
+        return f"FAIL stale_user token not expired: {c.deny}"
+    del os.environ["S24_GATEWAY_TOKEN"]
+    gw.CTX.deny = "no token"
+    return True
+
+
+check("token issued only on password, expires, verifies", _signed_token_roundtrip)
 
 
 def _lock_is_one_actor():
@@ -148,6 +212,7 @@ def _set_tier(tier: str):
 
 if _LIVE:
     Path(os.environ["S24_GATEWAY_LOCK"]).unlink(missing_ok=True)
+    gw.CTX.name, gw.CTX.tier, gw.CTX.deny = "admin_user", "admin", ""  # signed below
     check("transport round-trips to the phone", lambda: b"pong" in gw.adb("echo pong"))
     check("phone answers as shell uid", lambda: "uid=2000" in gw.adb_text("id"))
     check("device_state returns battery and screen", lambda: "battery" in gw.device_state())
@@ -160,8 +225,9 @@ if _LIVE:
     check("act tier reaches tap once granted", lambda: (_set_tier("act"), isinstance(gw.tap(x=1, y=1)["ok"], bool))[1])
 
 # ------------------------------------------------------------- MCP handshake
-def _handshake():
-    env = dict(os.environ, S24_GATEWAY_TOKEN="OPERATOR_TOKEN_replace_me", PYTHONUNBUFFERED="1")
+def _handshake(tok: str, who: str) -> str:
+    """Run the server as a client would, with this token, and read whoami back."""
+    env = dict(os.environ, S24_GATEWAY_TOKEN=tok, PYTHONUNBUFFERED="1")
     reqs = (
         json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "selftest", "version": "0"}}})
         + "\n"
@@ -169,20 +235,26 @@ def _handshake():
         + "\n"
         + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         + "\n"
+        + json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "whoami", "arguments": {}}})
+        + "\n"
     )
     p = subprocess.run([sys.executable, str(HERE / "s24-gateway.py")], input=reqs.encode(), capture_output=True, timeout=60, env=env)
     lines = [json.loads(l) for l in p.stdout.decode().splitlines() if l.strip().startswith("{")]
     tools = next((m["result"]["tools"] for m in lines if m.get("id") == 2 and "result" in m), None)
     if not tools:
-        return f"no tools/list reply: rc={p.returncode} err={p.stderr.decode()[:200]}"
+        return f"no tools/list: rc={p.returncode} err={p.stderr.decode()[:160]}"
     names = {t["name"] for t in tools}
     for must in ("device_state", "ui_tree", "tap", "shell", "screenshot", "whoami"):
         if must not in names:
             return f"missing {must}"
-    return f"{len(names)} tools, handshake clean"
+    raw = next((m["result"]["content"][0]["text"] for m in lines if m.get("id") == 3), "{}")
+    return json.dumps(json.loads(raw), sort_keys=True)
 
 
-check("MCP stdio handshake serves the tool list", _handshake)
+check("MCP handshake: signed token honoured as admin_user/admin",
+      lambda: (lambda r: '"tier": "admin"' in r and '"who": "admin_user"' in r or f"FAIL {r}")(_handshake(gw.issue("admin_user"), "admin_user")))
+check("MCP handshake: stranger denied, tools still listed",
+      lambda: (lambda r: '"deny"' in r or f"FAIL {r}")(_handshake("nobody.9999999999.deadbeef", "nobody")))
 
 print(f"\n{passed} passed, {failed} failed, {skipped} skipped (live phone)")
 sys.exit(1 if failed else 0)

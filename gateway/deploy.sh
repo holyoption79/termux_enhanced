@@ -16,7 +16,14 @@ mkdir -p "$DEST"
 install -m 0755 "$SRC/server/s24-gateway.py" "$DEST/s24-gateway.py"
 install -m 0644 "$SRC/server/test_gateway.py"  "$DEST/test_gateway.py"
 install -m 0644 "$SRC/server/probe_client.py"  "$DEST/probe_client.py"
-[ -f "$DEST/tokens.json" ] || install -m 0644 "$SRC/server/tokens.json" "$DEST/tokens.json"
+install -m 0700 "$SRC/server/issue.py"         "$DEST/issue.py"
+
+# One key per install. Rotating it invalidates every live token immediately.
+if [ ! -f "$DEST/secret.key" ]; then
+  (umask 077 && openssl rand -hex 32 > "$DEST/secret.key")
+  echo "   generated secret.key (chmod 600) — rotate to invalidate every token"
+fi
+[ -f "$DEST/users.json" ] || echo '{}' > "$DEST/users.json"
 
 echo "== phone wrapper -> $SSH:$PREFIX/bin/s24-adbx"
 if scp -q -o BatchMode=yes -o ConnectTimeout=10 "$SRC/phone/s24-adbx" "$SSH:$PREFIX/bin/s24-adbx" 2>/dev/null \
@@ -26,19 +33,12 @@ else
   echo "   phone not reachable — wrapper install skipped, re-run when phone wakes"
 fi
 
-echo "== tokens (edit tiers per client)"
-python3 - "$DEST/tokens.json" <<'PY'
-import json, secrets, sys
-p = sys.argv[1]
-d = json.load(open(p))
-live = {k: v for k, v in d.items() if "replace_me" not in k}
-for name, tier in (("operator", "admin"), ("observer", "read")):
-    if not any(v.get("name") == name for v in live.values()):
-        live[secrets.token_hex(16)] = {"name": name, "tier": tier}
-json.dump(live, open(p, "w"), indent=2)
-for k, v in live.items():
-    print(f"  {v['tier']:5s} {v['name']:10s} S24_GATEWAY_TOKEN={k}")
-PY
+echo "== users (add one per client: issue.py add <name> <tier> [ttl_days]) =="
+if [ "$(python3 -c "import json;print(len(json.load(open('$DEST/users.json'))))")" = "0" ]; then
+  echo "   no users yet. Run: cd $DEST && python3 issue.py add <you> admin 90"
+  echo "   Then: python3 issue.py list   /   python3 issue.py <you>"
+fi
+python3 "$DEST/issue.py" list 2>/dev/null || true
 
 echo "== selftest"
 cd "$DEST" && python3 test_gateway.py
@@ -46,10 +46,11 @@ cd "$DEST" && python3 test_gateway.py
 cat <<EOF
 
 == client config (any node on the tailnet)
-  ssh does not forward environment, so the token rides as a remote assignment:
+  ssh forwards no environment: the signed token rides on the remote command line.
+  Mint one with: python3 $DEST/issue.py <your-user>
   "s24": {
     "command": "ssh",
-    "args": ["llmmaster", "S24_GATEWAY_TOKEN=<token above> python3 $DEST/s24-gateway.py"],
+    "args": ["llmmaster", "S24_GATEWAY_TOKEN=<user.expiry.signature> python3 $DEST/s24-gateway.py"],
     "timeout": 60000
   }
 EOF

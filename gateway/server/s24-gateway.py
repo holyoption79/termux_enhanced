@@ -26,6 +26,8 @@ State lives next to the script:
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -39,7 +41,8 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 HERE = Path(__file__).resolve().parent
-TOKENS = Path(os.environ.get("S24_GATEWAY_TOKENS", HERE / "tokens.json"))
+USERS = Path(os.environ.get("S24_GATEWAY_USERS", HERE / "users.json"))
+SECRET = Path(os.environ.get("S24_GATEWAY_SECRET", HERE / "secret.key"))
 LOCK = Path(os.environ.get("S24_GATEWAY_LOCK", HERE / "lock.json"))
 AUDIT_DIR = Path(os.environ.get("S24_GATEWAY_AUDIT", HERE))
 LOCK_TTL = float(os.environ.get("S24_GATEWAY_LOCK_TTL", "120"))
@@ -79,44 +82,91 @@ class TierError(RuntimeError):
 
 @dataclass
 class Ctx:
-    name: str = "anonymous"
-    tier: str = "read"
-    token: str = "-"
+    name: str = ""
+    tier: str = ""
+    deny: str = "no token"
 
 
 CTX = Ctx()
 
 
-def _load_tokens() -> dict:
+def _secret() -> bytes:
+    return SECRET.read_bytes().strip()
+
+
+def _sig(body: str) -> str:
+    return hmac.new(_secret(), body.encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def pass_hash(password: str) -> str:
+    """Stored form of a password: keyed by the server secret, so a leaked
+    users.json leaks nothing."""
+    return hashlib.sha256(_secret() + password.encode()).hexdigest()
+
+
+def _users() -> dict:
     try:
-        return json.loads(TOKENS.read_text())
+        return json.loads(USERS.read_text())
     except Exception:
         return {}
 
 
-def identify() -> Ctx:
-    """Bind this process to a token from the environment. Unknown tokens get read.
+def issue(user: str) -> str:
+    """Sign a token for an existing user. issue.py calls this after checking
+    the password. The token is self-describing and self-expiring: no store,
+    no rotation dance, just secret.key changing to kill every live token."""
+    entry = _users().get(user)
+    if not entry:
+        raise KeyError(user)
+    exp = int(time.time()) + int(entry.get("ttl_days", 90)) * 86400
+    return f"{user}.{exp}.{_sig(f'{user}.{exp}')}"
 
-    Over the SSH-stdio transport, ssh forwards no environment: the token has to
-    be assigned on the remote command line (`S24_GATEWAY_TOKEN=x python3 ...`).
-    A client that forgets lands here with no token and gets read, which is the
-    safe direction.
+
+def identify() -> Ctx:
+    """Bind this process to a signed, unexpired token naming a known user.
+
+    Everything else is denied. There is no read-only fallback for strangers:
+    screen text, notifications and logcat are the owner's own data, and a
+    gateway that hands them out to whoever connects is not a gateway the owner
+    can leave running.
+
+    ssh forwards no environment, so the token has to ride as a remote command
+    line assignment: S24_GATEWAY_TOKEN=user.exp.sig python3 s24-gateway.py
     """
     tok = os.environ.get("S24_GATEWAY_TOKEN", "").strip()
     if not tok:
+        CTX.deny = "no token: run 'python3 issue.py <user>' in ~/s24-gateway on llmmaster"
         return CTX
-    entry = _load_tokens().get(tok)
+    parts = tok.split(".")
+    if len(parts) != 3:
+        CTX.deny = "bad token: want <user>.<expiry>.<signature>"
+        return CTX
+    user, exp_s, mac = parts
+    try:
+        exp = int(exp_s)
+    except ValueError:
+        CTX.deny = "bad token: expiry is not a number"
+        return CTX
+    if not hmac.compare_digest(mac, _sig(f"{user}.{exp}")):
+        CTX.deny = f"bad signature for '{user}': not signed by this server"
+        return CTX
+    if exp < int(time.time()):
+        CTX.deny = f"'{user}' token expired: mint a new one"
+        return CTX
+    entry = _users().get(user)
     if not entry:
+        CTX.deny = f"'{user}' is not in users.json"
         return CTX
     tier = entry.get("tier", "read")
-    ctx = Ctx(name=entry.get("name", tok[:8]), tier=tier if tier in TIERS else "read", token=tok)
-    CTX.__dict__.update(ctx.__dict__)
+    CTX.name, CTX.tier, CTX.deny = user, (tier if tier in TIERS else "read"), ""
     return CTX
 
 
 def need(min_tier: str) -> None:
+    if CTX.deny:
+        raise TierError(CTX.deny)
     if TIERS[CTX.tier] < TIERS[min_tier]:
-        raise TierError(f"token '{CTX.name}' is {CTX.tier}; {min_tier} tier required")
+        raise TierError(f"'{CTX.name}' is {CTX.tier}; {min_tier} tier required")
 
 
 def classify(cmd: str) -> str:
@@ -217,7 +267,10 @@ app = FastMCP("s24-gateway")
 
 @app.tool()
 def whoami() -> dict:
-    """Which token/tier this client is bound to, and who holds the phone."""
+    """Who this client is, what tier, and who holds the phone. Strangers see the
+    denial reason and nothing else — holder identity is not public."""
+    if CTX.deny:
+        return {"deny": CTX.deny}
     try:
         holder = json.loads(LOCK.read_text())
     except Exception:
@@ -228,38 +281,37 @@ def whoami() -> dict:
 
 @app.tool()
 def device_state() -> dict:
-    """Lock state, battery, screen size/orientation, radio and net type. Read tier."""
+    """Screen size, rotation, battery, serving cell and network. Read tier.
+
+    'rotation' is settings system user_rotation: 0=upright, 1=90 left, 2=inverted,
+    3=90 right. Every field is read on its own so a key this device does not
+    have shows up as 'err ...' on that one field instead of failing the read.
+    """
     need("read")
     t0 = time.time()
     out: dict = {}
+    acquire("device_state")
 
-    def run():
-        return adb_text("dumpsys window displays | grep -m1 -E 'cur='")
+    def field(label: str, cmd: str):
+        """Only commands that always exit 0 on the S24 Ultra belong here: a bare
+        'grep' with no match returns 1 and adb propagates it as a failure."""
+        try:
+            out[label] = adb_text(cmd)
+        except Exception as e:
+            out[label] = f"err {type(e).__name__}: {e}"
 
-    try:
-        out["windows"] = _call(run, "device_state", {}, t0)
-    except Exception as e:
-        out["windows"] = f"err {e}"
-    try:
-        keep = ("AC powered", "USB powered", "Wireless powered", "level", "status", "voltage", "temperature", "technology")
-        rows = [p.split(":", 1) for p in adb_text("dumpsys battery | head -20").splitlines() if ":" in p]
-        out["battery"] = {k.strip(): v.strip() for k, v in rows if k.strip() in keep}
-    except Exception as e:
-        out["battery"] = f"err {e}"
-    try:
-        # 'wm orientation' does not exist on this device and takes the whole read down with it.
-        out["screen"] = adb_text("wm size; dumpsys input | grep -m1 SurfaceOrientation; dumpsys display | grep -m1 mDefaultMode")
-    except Exception as e:
-        out["screen"] = f"err {e}"
-    try:
-        reg = adb_text("dumpsys telephony.registry | grep -m1 -E 'mServiceState|mDataConnectionState'")
-        out["radio"] = reg
-    except Exception as e:
-        out["radio"] = f"err {e}"
-    try:
-        out["net"] = adb_text("ip route | head -3; dumpsys wifi | grep -m1 -E 'mWifiInfo'")
-    except Exception as e:
-        out["net"] = f"err {e}"
+    field("windows", "dumpsys window displays | grep -m1 -E 'cur=' || true")
+    field("battery", "dumpsys battery | grep -E 'powered|level:|status:|voltage:|temperature:|technology:' | head -8 || true")
+    # wm size and settings get always answer; 'wm orientation' and
+    # 'SurfaceOrientation' do not exist on this device and sank the whole read.
+    field("screen", "wm size")
+    field("rotation", "settings get system user_rotation")
+    field("radio", "dumpsys telephony.registry | grep -m2 -E 'mServiceState|mDataConnectionState' || true")
+    field("net", "ip route | head -3 || true")
+    field("wifi", "dumpsys wifi | grep -m1 -E 'mWifiInfo' || true")
+
+    got = sum(1 for v in out.values() if not str(v).startswith("err"))
+    audit("device_state", {}, True, f"{got}/{len(out)} fields", int((time.time() - t0) * 1000))
     return out
 
 
@@ -371,7 +423,7 @@ def logcat(tags: str = "", grep: str = "", lines: int = 80) -> str:
     spec = f"logcat -d -t {int(lines)}"
     if tags:
         spec = f"logcat -d -t {int(lines)} {tags}"
-    cmd = spec + (f" | grep -E {shlex.quote(grep)}" if grep else "")
+    cmd = spec + (f" | grep -E {shlex.quote(grep)} || true" if grep else "")
     r = _call(lambda: adb_text(cmd, timeout=30), "logcat", {"tags": tags, "grep": grep}, t0)
     return r
 
